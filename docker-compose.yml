@@ -1,0 +1,18 @@
+services:
+  remediation-pipeline:
+    build: .
+    image: devin-remediation-pipeline
+    container_name: devin-remediation
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # Override the default (/data/state.db lives on the named volume).
+      DB_PATH: /data/state.db
+    volumes:
+      - pipeline-state:/data
+    restart: unless-stopped
+
+volumes:
+  pipeline-state:

@@ -1,0 +1,19 @@
+# Secrets & local config
+.env
+context/
+.claude/
+
+# State & data
+*.db
+*.db-wal
+*.db-shm
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# macOS
+.DS_Store
+.vscode/
