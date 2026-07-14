@@ -21,6 +21,27 @@ class Settings:
     devin_mode: str = os.getenv("DEVIN_MODE", "normal")
     devin_max_acu: int = int(os.getenv("DEVIN_MAX_ACU", "10"))
 
+    # Independent PR review (Devin-as-reviewer). Kept cheap and capped: a review
+    # reads a small diff, so it needs far fewer ACUs than a remediation. Reviews
+    # auto-fire when a remediation first opens a PR (mirrors Cognition's
+    # "review on PR open" pattern); `review_enabled=0` disables that.
+    review_enabled: bool = _bool("REVIEW_ENABLED", True)
+    review_max_acu: int = int(os.getenv("REVIEW_MAX_ACU", "3"))
+    review_mode: str = os.getenv("REVIEW_MODE", "lite")
+    # review_trigger: 'on_pr_open' (auto-review when a PR is opened, via the
+    # pull_request webhook / reconciler) | 'manual' (only the Review button).
+    # Runtime-tunable on the Settings tab.
+    review_trigger: str = os.getenv("REVIEW_TRIGGER", "on_pr_open")
+
+    # Author-side autofix loop: when a review returns request_changes, dispatch a
+    # bounded fix session for the red findings, push to the same branch, and
+    # re-review the new commit. Capped rounds, then escalate to a human — the
+    # loop converges by shrinking scope each pass, not by negotiating.
+    autofix_enabled: bool = _bool("AUTOFIX_ENABLED", True)
+    autofix_max_rounds: int = int(os.getenv("AUTOFIX_MAX_ROUNDS", "2"))
+    autofix_max_acu: int = int(os.getenv("AUTOFIX_MAX_ACU", "8"))
+    autofix_mode: str = os.getenv("AUTOFIX_MODE", "normal")
+
     target_repo: str = os.getenv("TARGET_REPO", "louisgrimaldi/superset")
 
     github_token: str = os.getenv("GITHUB_TOKEN", "")

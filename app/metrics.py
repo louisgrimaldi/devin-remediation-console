@@ -8,15 +8,35 @@ from __future__ import annotations
 
 from .db import Store
 
-_ACTIVE = {"queued", "running", "claimed", "resuming", "suspended"}
+
+def remediation_phase(r: dict) -> str:
+    """Collapse Devin's raw session lifecycle into the only three states a user
+    cares about:
+
+      * ``success``     — a PR exists, whatever the session is doing now.
+      * ``failed``      — the session errored, or terminally exited (or was
+                          suspended for inactivity) without ever opening a PR.
+      * ``in_progress`` — anything else still working toward a PR.
+
+    Devin's own ``suspended``/``waiting_for_user``/``inactivity`` states are
+    implementation detail; a suspended session that already opened a PR is a
+    success, and one that ended without a PR is a failure.
+    """
+    if r.get("pr_url"):
+        return "success"
+    if r.get("status") in {"error", "exit", "suspended"}:
+        return "failed"
+    return "in_progress"
 
 
 def summarize(store: Store) -> dict[str, float]:
     rows = store.all()
-    active = sum(1 for r in rows if r["status"] in _ACTIVE)
-    completed = sum(1 for r in rows if r["status"] == "exit")
-    errored = sum(1 for r in rows if r["status"] == "error")
+    phases = [remediation_phase(r) for r in rows]
+    active = sum(1 for p in phases if p == "in_progress")
     prs = sum(1 for r in rows if r["pr_url"])
+    failed = sum(1 for p in phases if p == "failed")
+    completed = prs          # a remediation is "done" once its PR is raised
+    errored = failed
     acus = sum(float(r["acus_consumed"] or 0) for r in rows)
     total = len(rows)
     # Time-to-PR (seconds): dispatch -> when the PR first appeared, averaged
@@ -45,6 +65,7 @@ def summarize(store: Store) -> dict[str, float]:
         "active": active,
         "completed": completed,
         "errored": errored,
+        "failed": failed,
         "prs_opened": prs,
         "prs_merged": prs_merged,
         "acus_consumed": round(acus + scan_acus, 2),
@@ -64,13 +85,13 @@ def render_prometheus(store: Store) -> str:
         "# HELP remediation_total Total remediations tracked.",
         "# TYPE remediation_total gauge",
         f"remediation_total {m['total']}",
-        "# HELP remediation_active Sessions currently in flight.",
+        "# HELP remediation_active Remediations in progress (working toward a PR).",
         "# TYPE remediation_active gauge",
         f"remediation_active {m['active']}",
-        "# HELP remediation_completed Sessions that exited.",
+        "# HELP remediation_completed Remediations that succeeded (PR raised).",
         "# TYPE remediation_completed gauge",
         f"remediation_completed {m['completed']}",
-        "# HELP remediation_errored Sessions that errored.",
+        "# HELP remediation_errored Remediations that failed (no PR).",
         "# TYPE remediation_errored gauge",
         f"remediation_errored {m['errored']}",
         "# HELP remediation_prs_opened Pull requests opened by Devin.",

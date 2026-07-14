@@ -14,7 +14,7 @@ from typing import Optional
 
 from .config import settings
 from .db import Store
-from .metrics import summarize
+from .metrics import remediation_phase, summarize
 
 _STATUS_COLOR = {
     "queued": "#9ca3af", "running": "#2563eb", "claimed": "#2563eb",
@@ -52,6 +52,23 @@ def _fmt_duration(seconds: float) -> str:
 def _badge(status: str) -> str:
     color = _STATUS_COLOR.get(status, "#9ca3af")
     return f'<span class="badge" style="background:{color}">{_esc(status)}</span>'
+
+
+# User-facing remediation phase: the only three states a leader cares about.
+_PHASE = {
+    "in_progress": ("In progress", "#2563eb"),
+    "success": ("PR raised", "#16a34a"),
+    "failed": ("Failed", "#dc2626"),
+}
+
+
+def _phase_badge(r: dict) -> str:
+    """Badge the derived phase (In progress / PR raised / Failed), with Devin's
+    raw session state demoted to a muted sub-line for the technical audience."""
+    label, color = _PHASE[remediation_phase(r)]
+    raw = r.get("status_detail") or r.get("status") or ""
+    detail = f'<div class="detail">Devin: {_esc(raw)}</div>' if raw else ""
+    return f'<span class="badge" style="background:{color}">{label}</span>{detail}'
 
 
 def _sev(sev: str) -> str:
@@ -346,7 +363,50 @@ def render_security(store: Store, selected_scan_id: str = "") -> str:
 
 
 # --------------------------------------------------------------------- Review
-def _review_row(r: dict) -> str:
+_VERDICT = {
+    "approve": ("✅ Approved", "#16a34a"),
+    "request_changes": ("🛑 Changes", "#dc2626"),
+    "comment": ("💬 Comment", "#6b7280"),
+}
+
+
+def _review_cell(rev: Optional[dict]) -> str:
+    """Independent-reviewer verdict for a PR, including the autofix-loop state
+    (reviewing → request_changes → autofixing → re-review → approved / escalated)."""
+    if not rev:
+        return '<span class="detail">—</span>'
+    rnd = rev.get("round") or 1
+    round_tag = f' · r{rnd}' if rnd > 1 else ""
+
+    # Human escalation is terminal — surface it loudest.
+    if rev.get("escalated"):
+        return (f'<span class="badge" style="background:#b45309">⚠️ Escalated</span>'
+                f'<div class="detail">human review needed{round_tag}</div>')
+    # Autofix in flight (blocking review handed to a bounded fix session).
+    if rev.get("autofix_session_id") and not rev.get("reviewed_next"):
+        link = (f' <a href="{_esc(rev["autofix_url"])}" target="_blank">↗</a>'
+                if rev.get("autofix_url") else "")
+        return (f'<span class="badge" style="background:#7c3aed">🔁 Autofixing</span>{link}'
+                f'<div class="detail">addressing red findings{round_tag}</div>')
+
+    verdict = rev.get("verdict")
+    if not verdict:
+        link = (f' <a href="{_esc(rev["devin_url"])}" target="_blank">↗</a>'
+                if rev.get("devin_url") else "")
+        return f'<span class="badge" style="background:#2563eb">⏳ Reviewing</span>{link}<div class="detail">{round_tag.lstrip(" ·")}</div>'
+    label, color = _VERDICT.get(verdict, (verdict, "#6b7280"))
+    counts = []
+    if rev.get("n_red"):    counts.append(f'🔴{rev["n_red"]}')
+    if rev.get("n_yellow"): counts.append(f'🟡{rev["n_yellow"]}')
+    if rev.get("n_gray"):   counts.append(f'⚪{rev["n_gray"]}')
+    detail = " ".join(counts) + round_tag
+    tail = f'<div class="detail">{detail.strip()}</div>' if detail.strip() else ""
+    link = (f' <a href="{_esc(rev["devin_url"])}" target="_blank">↗</a>'
+            if rev.get("devin_url") else "")
+    return f'<span class="badge" style="background:{color}">{label}</span>{link}{tail}'
+
+
+def _review_row(r: dict, rev: Optional[dict] = None) -> str:
     if r.get("pr_url"):
         pr = f'<a href="{_esc(r["pr_url"])}" target="_blank">PR ↗ {_esc(r.get("pr_state") or "open")}</a>'
     else:
@@ -361,9 +421,10 @@ def _review_row(r: dict) -> str:
     <tr>
       <td>{sev_cell}</td>
       <td>{issue}<div class="detail">updated {_ts(r.get('updated_at'))}</div></td>
-      <td>{_badge(r.get('status'))}<div class="detail">{_esc(r.get('status_detail') or '')}</div></td>
+      <td>{_phase_badge(r)}</td>
       <td>{session}</td>
       <td>{pr}</td>
+      <td>{_review_cell(rev)}</td>
     </tr>"""
 
 
@@ -374,8 +435,10 @@ def render_review(store: Store) -> str:
     # since store.all() already returns rows most-recently-active first).
     rows.sort(key=lambda r: (_SEV_RANK.get((r.get("severity") or "").lower(), 9),
                              r.get("priority") if r.get("priority") is not None else 999))
-    body = "".join(_review_row(r) for r in rows) or (
-        '<tr><td colspan="5" class="empty">Nothing to review yet. '
+    body = "".join(
+        _review_row(r, store.latest_review_for_issue(r["issue_number"])) for r in rows
+    ) or (
+        '<tr><td colspan="6" class="empty">Nothing to review yet. '
         'File a finding on the Security tab and Devin will open a PR here.</td></tr>')
     stats = "".join([
         _stat("In flight", str(m["active"]), "#2563eb"),
@@ -385,10 +448,15 @@ def render_review(store: Store) -> str:
     ])
     content = f"""
     <div class="head"><h1>🔀 Review</h1>
-      <span class="sub">Issues Devin is remediating and the pull requests it opened</span>{{{{LIVE}}}}</div>
+      <span class="sub">Issues Devin is remediating, the PRs it opened, and an
+      independent Devin review of each</span>{{{{LIVE}}}}</div>
     <div class="stats">{stats}</div>
+    <form method="post" action="/reviews/run" style="margin:0 0 14px">
+      <button class="btn" type="submit">🔎 Run independent Devin review</button>
+      <span class="detail" style="margin-left:8px">A fresh Devin session reviews each open PR — advisory only, never edits the branch.</span>
+    </form>
     <table>
-      <thead><tr><th>Severity</th><th>Issue</th><th>Status</th><th>Session</th><th>Pull request</th></tr></thead>
+      <thead><tr><th>Severity</th><th>Issue</th><th>Status</th><th>Session</th><th>Pull request</th><th>Devin review</th></tr></thead>
       <tbody>{body}</tbody>
     </table>"""
     return _layout("/review", content, 5)
@@ -406,11 +474,21 @@ def _select(name: str, current: str, options: list[tuple[str, str]]) -> str:
 def render_settings(store: Store) -> str:
     trigger = store.get_setting("remediation_trigger", settings.remediation_trigger)
     schedule = store.get_setting("scan_schedule", settings.scan_schedule)
+    review_trigger = store.get_setting("review_trigger", settings.review_trigger)
+    autofix = store.get_setting("autofix", "on" if settings.autofix_enabled else "off")
     dispatch = "enabled" if settings.dispatch_enabled else "dry-run (no Devin sessions)"
 
     trigger_sel = _select("remediation_trigger", trigger, [
         ("on_creation", "On issue creation"),
         ("on_comment", f"When {settings.trigger_command} is commented"),
+    ])
+    review_sel = _select("review_trigger", review_trigger, [
+        ("on_pr_open", "Automatically when a PR is opened"),
+        ("manual", "Manually (Review tab button only)"),
+    ])
+    autofix_sel = _select("autofix", autofix, [
+        ("on", f"On — autofix red findings, then re-review (max {settings.autofix_max_rounds} rounds)"),
+        ("off", "Off — leave request-changes for a human"),
     ])
     schedule_sel = _select("scan_schedule", schedule, [
         ("manual", "Manual only"),
@@ -434,6 +512,24 @@ def render_settings(store: Store) -> str:
       </div>
 
       <div class="card">
+        <h2>Independent review of Devin's PRs</h2>
+        <p>When a remediation opens a PR, a separate Devin session reviews it
+           (advisory only). <b>Automatically</b> fires from the
+           <code>pull_request</code> webhook the instant the PR is opened;
+           <b>Manually</b> waits for the Review-tab button.</p>
+        {review_sel}
+      </div>
+
+      <div class="card">
+        <h2>Close the loop — autofix review findings</h2>
+        <p>When a review returns <b>request changes</b>, hand the red findings to a
+           bounded fix session (scoped to just those findings, pushed to the same
+           branch), then re-review the new commit. Capped rounds, then it escalates
+           to a human — so it converges instead of looping.</p>
+        {autofix_sel}
+      </div>
+
+      <div class="card">
         <h2>Run code scan</h2>
         <p>Schedule an automatic Devin code scan, or keep it manual and click
            <b>Perform Devin scan</b> on the Security tab yourself.</p>
@@ -446,7 +542,7 @@ def render_settings(store: Store) -> str:
     <div class="card" style="margin-top:22px;">
       <h2>Configuration</h2>
       <div class="kv"><b>Trigger label:</b> <code>{_esc(settings.trigger_label)}</code></div>
-      <div class="kv"><b>Webhook endpoint:</b> <code>POST /webhook</code> (HMAC-verified)</div>
+      <div class="kv"><b>Webhook endpoint:</b> <code>POST /webhook</code> (HMAC-verified) — <code>issues</code> → remediate, <code>pull_request</code> → review</div>
       <div class="kv"><b>Dispatch:</b> {_esc(dispatch)} · <b>Max ACU/session:</b> {settings.devin_max_acu}</div>
       <div class="kv"><b>Observability:</b> <a href="/metrics">/metrics</a> · <a href="/api/state">/api/state</a></div>
     </div>"""
@@ -563,6 +659,18 @@ def _sankey(store: Store) -> str:
         rects.append(f'<rect x="{x}" y="{ny:.1f}" width="{nw}" height="{max(h,2):.1f}" '
                      f'rx="3" style="fill:{color}"/>')
 
+    # Name each severity band next to its node (color-matched) so the colours
+    # are self-explanatory — the label doubles as the legend.
+    sev_labels = []
+    for k in KEYS:
+        x, ny, h, color = nodes["sev:" + k]
+        if h <= 0:
+            continue
+        sev_labels.append(
+            f'<text x="{x + nw + 6}" y="{ny + h / 2 + 4:.1f}" text-anchor="start" '
+            f'style="fill:{color};font:700 11px var(--m,ui-sans-serif)">'
+            f'{k.capitalize()} {total_by[k]}</text>')
+
     def hdr(cx, title, count, anchor="middle"):
         return (f'<text x="{cx}" y="16" text-anchor="{anchor}" '
                 f'style="fill:#6b7280;font:600 11px var(--m,ui-sans-serif)">{title}</text>'
@@ -577,7 +685,7 @@ def _sankey(store: Store) -> str:
         + hdr(732, "Merged", sum(merged_by.values()), "end")
     )
     return (f'<svg viewBox="0 0 {W} {H}" style="width:100%;height:auto;display:block">'
-            f'{"".join(ribbons)}{"".join(rects)}{labels}</svg>')
+            f'{"".join(ribbons)}{"".join(rects)}{"".join(sev_labels)}{labels}</svg>')
 
 
 def _funnel_row(label: str, value: int, total: int, color: str) -> str:

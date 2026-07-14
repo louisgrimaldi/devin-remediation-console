@@ -88,6 +88,32 @@ CREATE TABLE IF NOT EXISTS app_settings (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+
+-- One independent Devin review per PR commit SHA (idempotency key). Keeps the
+-- reviewer's verdict as structured data so it never turns into a comment loop.
+CREATE TABLE IF NOT EXISTS reviews (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo             TEXT NOT NULL,
+    pr_url           TEXT NOT NULL,
+    pr_number        INTEGER,
+    issue_number     INTEGER,
+    head_sha         TEXT NOT NULL,
+    devin_session_id TEXT,
+    devin_url        TEXT,
+    status           TEXT NOT NULL DEFAULT 'queued',
+    status_detail    TEXT,
+    verdict          TEXT,
+    summary          TEXT,
+    n_red            INTEGER DEFAULT 0,
+    n_yellow         INTEGER DEFAULT 0,
+    n_gray           INTEGER DEFAULT 0,
+    acus_consumed    REAL DEFAULT 0,
+    comment_posted   INTEGER DEFAULT 0,
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL,
+    completed_at     TEXT,
+    UNIQUE(pr_url, head_sha)
+);
 """
 
 _SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
@@ -106,6 +132,13 @@ class Store:
         self._ensure_column("remediations", "severity", "TEXT")
         self._ensure_column("remediations", "category", "TEXT")
         self._ensure_column("remediations", "priority", "INTEGER")
+        # Autofix loop state, hung off the review row it belongs to.
+        self._ensure_column("reviews", "round", "INTEGER DEFAULT 1")
+        self._ensure_column("reviews", "autofix_session_id", "TEXT")
+        self._ensure_column("reviews", "autofix_url", "TEXT")
+        self._ensure_column("reviews", "autofix_status", "TEXT")
+        self._ensure_column("reviews", "reviewed_next", "INTEGER DEFAULT 0")
+        self._ensure_column("reviews", "escalated", "INTEGER DEFAULT 0")
         self._conn.commit()
         self._backfill_remediation_severity()
 
@@ -335,13 +368,18 @@ class Store:
         pr_url: Optional[str],
         pr_state: Optional[str],
         acus: float,
+        pr_opened_at: Optional[str] = None,
     ) -> None:
         completed_at = _now() if status in {"exit", "error"} else None
-        # Stamp when the PR was first seen (only sets once, via COALESCE).
-        pr_opened_ts = _now() if pr_url else None
+        # Stamp when the PR was opened (only sets once, via COALESCE). Prefer the
+        # PR's real GitHub creation time when the caller supplies it, so the
+        # metric doesn't count reconciler-detection lag; fall back to now.
+        pr_opened_ts = (pr_opened_at or _now()) if pr_url else None
         self._write(
             """UPDATE remediations
-               SET status=?, status_detail=?, pr_url=?, pr_state=?, acus_consumed=?,
+               SET status=?, status_detail=?, pr_url=?,
+                   pr_state=CASE WHEN pr_state='merged' THEN 'merged' ELSE ? END,
+                   acus_consumed=?,
                    updated_at=?, pr_opened_at=COALESCE(pr_opened_at, ?),
                    completed_at=COALESCE(?, completed_at)
                WHERE issue_number=?""",
@@ -390,3 +428,125 @@ class Store:
                WHERE devin_session_id IS NOT NULL AND status NOT IN ('exit','error')"""
         )
         return [dict(r) for r in cur.fetchall()]
+
+    # ---------------------------------------------------------------- reviews
+    def get_review(self, pr_url: str, head_sha: str) -> Optional[dict[str, Any]]:
+        cur = self._conn.execute(
+            "SELECT * FROM reviews WHERE pr_url=? AND head_sha=?", (pr_url, head_sha)
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def create_review(
+        self, *, repo: str, pr_url: str, pr_number: int,
+        issue_number: Optional[int], head_sha: str, round_no: int = 1,
+    ) -> Optional[int]:
+        """Register a review intent for (pr_url, head_sha). Returns the new row id,
+        or None if a review for this exact commit already exists (idempotent)."""
+        if self.get_review(pr_url, head_sha):
+            return None
+        now = _now()
+        with _LOCK:
+            cur = self._conn.execute(
+                """INSERT OR IGNORE INTO reviews
+                   (repo, pr_url, pr_number, issue_number, head_sha, round, status, created_at, updated_at)
+                   VALUES (?,?,?,?,?,?, 'queued', ?, ?)""",
+                (repo, pr_url, pr_number, issue_number, head_sha, round_no, now, now),
+            )
+            self._conn.commit()
+            return cur.lastrowid if cur.rowcount else None
+
+    def mark_review_dispatched(self, review_id: int, session_id: str, url: str) -> None:
+        self._write(
+            """UPDATE reviews SET devin_session_id=?, devin_url=?, status='running', updated_at=?
+               WHERE id=?""",
+            (session_id, url, _now(), review_id),
+        )
+
+    def update_review_from_session(
+        self, review_id: int, *, status: str, status_detail: Optional[str], acus: float,
+        verdict: Optional[str], summary: Optional[str],
+        n_red: int, n_yellow: int, n_gray: int,
+    ) -> None:
+        completed_at = _now() if verdict else None
+        self._write(
+            """UPDATE reviews
+               SET status=?, status_detail=?, acus_consumed=?,
+                   verdict=COALESCE(?, verdict), summary=COALESCE(?, summary),
+                   n_red=?, n_yellow=?, n_gray=?, updated_at=?,
+                   completed_at=COALESCE(?, completed_at)
+               WHERE id=?""",
+            (status, status_detail, acus, verdict, summary,
+             n_red, n_yellow, n_gray, _now(), completed_at, review_id),
+        )
+
+    def mark_review_commented(self, review_id: int) -> None:
+        self._write("UPDATE reviews SET comment_posted=1, updated_at=? WHERE id=?", (_now(), review_id))
+
+    def reviews_to_poll(self) -> list[dict[str, Any]]:
+        """Dispatched reviews still awaiting a verdict."""
+        cur = self._conn.execute(
+            """SELECT * FROM reviews
+               WHERE devin_session_id IS NOT NULL AND verdict IS NULL
+                 AND status NOT IN ('exit','error')"""
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def latest_review_for_issue(self, issue_number: int) -> Optional[dict[str, Any]]:
+        cur = self._conn.execute(
+            "SELECT * FROM reviews WHERE issue_number=? ORDER BY id DESC LIMIT 1", (issue_number,)
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def all_reviews(self) -> list[dict[str, Any]]:
+        cur = self._conn.execute("SELECT * FROM reviews ORDER BY id DESC")
+        return [dict(r) for r in cur.fetchall()]
+
+    # ------------------------------------------------------------ autofix loop
+    def autofix_attempts(self, pr_url: str) -> int:
+        """How many autofix rounds have already been dispatched for this PR."""
+        cur = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM reviews WHERE pr_url=? AND autofix_session_id IS NOT NULL",
+            (pr_url,),
+        )
+        return cur.fetchone()["n"]
+
+    def reviews_needing_autofix(self) -> list[dict[str, Any]]:
+        """Blocking reviews (request_changes) not yet handled by an autofix or escalation."""
+        cur = self._conn.execute(
+            """SELECT * FROM reviews
+               WHERE verdict='request_changes' AND n_red > 0
+                 AND autofix_session_id IS NULL AND escalated=0"""
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def set_review_autofix(self, review_id: int, session_id: str, url: str) -> None:
+        self._write(
+            """UPDATE reviews SET autofix_session_id=?, autofix_url=?, autofix_status='dispatched',
+               updated_at=? WHERE id=?""",
+            (session_id, url, _now(), review_id),
+        )
+
+    def reviews_with_active_autofix(self) -> list[dict[str, Any]]:
+        """Reviews whose autofix is dispatched but hasn't yet produced a re-review."""
+        cur = self._conn.execute(
+            """SELECT * FROM reviews
+               WHERE autofix_session_id IS NOT NULL AND reviewed_next=0 AND escalated=0"""
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def update_autofix_status(self, review_id: int, status: str) -> None:
+        self._write(
+            "UPDATE reviews SET autofix_status=?, updated_at=? WHERE id=?",
+            (status, _now(), review_id),
+        )
+
+    def mark_review_reviewed_next(self, review_id: int) -> None:
+        self._write("UPDATE reviews SET reviewed_next=1, updated_at=? WHERE id=?", (_now(), review_id))
+
+    def mark_review_escalated(self, review_id: int) -> None:
+        self._write(
+            "UPDATE reviews SET escalated=1, reviewed_next=1, updated_at=? WHERE id=?",
+            (_now(), review_id),
+        )

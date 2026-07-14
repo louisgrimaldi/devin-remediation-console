@@ -31,13 +31,17 @@ from .devin import DevinClient
 from .logging_setup import configure_logging, log
 from .metrics import render_prometheus, summarize
 from .pipeline import (
+    enqueue_review,
     file_finding,
     maybe_scheduled_scan,
     poll_labeled_issues,
+    reconcile_autofix,
     reconcile_once,
+    reconcile_reviews,
     reconcile_scans,
     remediate_issue,
     start_scan,
+    sweep_open_prs_for_review,
 )
 
 configure_logging()
@@ -55,6 +59,8 @@ async def _reconcile_loop() -> None:
         try:
             await asyncio.to_thread(reconcile_scans, store, devin)
             await asyncio.to_thread(reconcile_once, store, devin)
+            await asyncio.to_thread(reconcile_reviews, store, devin)
+            await asyncio.to_thread(reconcile_autofix, store, devin)
         except Exception:  # noqa: BLE001 - keep the loop alive
             logger.exception("reconcile loop iteration failed")
         await asyncio.sleep(settings.reconcile_interval_seconds)
@@ -126,11 +132,18 @@ async def settings_save(request: Request) -> Response:
     form = urllib.parse.parse_qs(raw)
     trigger = (form.get("remediation_trigger", [None])[0])
     schedule = (form.get("scan_schedule", [None])[0])
+    review_trigger = (form.get("review_trigger", [None])[0])
+    autofix = (form.get("autofix", [None])[0])
     if trigger in {"on_creation", "on_comment"}:
         store.set_setting("remediation_trigger", trigger)
     if schedule in {"manual", "hourly", "daily", "weekly", "monthly"}:
         store.set_setting("scan_schedule", schedule)
-    log(logger, logging.INFO, "settings.updated", remediation_trigger=trigger, scan_schedule=schedule)
+    if review_trigger in {"on_pr_open", "manual"}:
+        store.set_setting("review_trigger", review_trigger)
+    if autofix in {"on", "off"}:
+        store.set_setting("autofix", autofix)
+    log(logger, logging.INFO, "settings.updated", remediation_trigger=trigger,
+        scan_schedule=schedule, review_trigger=review_trigger, autofix=autofix)
     return RedirectResponse("/settings", status_code=303)
 
 
@@ -162,8 +175,22 @@ async def api_state() -> JSONResponse:
             "scans": store.all_scans(),
             "findings": store.all_findings(),
             "remediations": store.all(),
+            "reviews": store.all_reviews(),
         }
     )
+
+
+@app.post("/reviews/run")
+async def reviews_run() -> Response:
+    """Dispatch an independent Devin review for every open tracked PR that hasn't
+    been reviewed at its current commit (Review tab button)."""
+    try:
+        n = await asyncio.to_thread(sweep_open_prs_for_review, store, devin)
+        log(logger, logging.INFO, "reviews.swept", dispatched=n)
+    except Exception as exc:  # noqa: BLE001 - surface on the dashboard, don't 500
+        logger.exception("review sweep failed")
+        log(logger, logging.ERROR, "reviews.error", error=str(exc))
+    return RedirectResponse("/review", status_code=303)
 
 
 # --------------------------------------------------------------------- actions
@@ -249,6 +276,36 @@ async def _trigger_remediation(issue: dict) -> None:
     )
 
 
+async def _handle_pr_review(action: str, pr: dict) -> Response:
+    """Dispatch an independent review when a PR is opened (pull_request webhook).
+
+    Gated by the Settings 'review_trigger' option: only fires in 'on_pr_open'.
+    Mirrors Cognition's 'review on PR open' pattern, event-driven."""
+    # 'synchronize' = new commits pushed to the PR (e.g. an autofix) -> re-review.
+    if action not in {"opened", "reopened", "ready_for_review", "synchronize"}:
+        return JSONResponse({"ignored": f"pr action={action}"}, status_code=202)
+    review_trigger = store.get_setting("review_trigger", settings.review_trigger)
+    if not settings.review_enabled or review_trigger != "on_pr_open":
+        return JSONResponse({"ignored": f"review_trigger={review_trigger}"}, status_code=202)
+
+    pr_url = pr.get("html_url") or pr.get("url")
+    if not pr_url:
+        return JSONResponse({"ignored": "no pr url"}, status_code=202)
+    # Link back to the remediation that opened it (for the Review tab), if any.
+    issue_number = next(
+        (r["issue_number"] for r in store.with_prs() if r.get("pr_url") == pr_url), None
+    )
+    review_id = await asyncio.to_thread(
+        enqueue_review, store, devin, pr_url=pr_url, issue_number=issue_number
+    )
+    log(logger, logging.INFO, "webhook.pr_review", pr=pr.get("number"), review_id=review_id)
+    return JSONResponse(
+        {"pr": pr.get("number"), "review_id": review_id,
+         "dispatched": review_id is not None},
+        status_code=202,
+    )
+
+
 @app.post("/webhook")
 async def webhook(request: Request) -> Response:
     """GitHub webhook receiver.
@@ -257,6 +314,7 @@ async def webhook(request: Request) -> Response:
       * on_creation — react to `issues` opened/labeled carrying the trigger label.
       * on_comment  — react to `issue_comment` created containing the command
                       (e.g. `/devin`).
+      * pull_request opened — dispatch an independent review (if enabled).
     """
     raw = await request.body()
     if not github.verify_signature(raw, request.headers.get("X-Hub-Signature-256")):
@@ -267,6 +325,12 @@ async def webhook(request: Request) -> Response:
     payload = json.loads(raw or b"{}")
     action = payload.get("action")
     issue = payload.get("issue", {})
+
+    # A PR being opened triggers an INDEPENDENT review — separate from the
+    # issue-remediation trigger mode below.
+    if event == "pull_request":
+        return await _handle_pr_review(action, payload.get("pull_request") or {})
+
     mode = store.get_setting("remediation_trigger", settings.remediation_trigger)
 
     if mode == "on_comment":

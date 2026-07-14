@@ -31,14 +31,16 @@ class DevinClient:
         title: str,
         tags: list[str],
         structured_output_schema: Optional[dict] = None,
+        devin_mode: Optional[str] = None,
+        max_acu: Optional[int] = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "prompt": prompt,
             "title": title,
             "tags": tags,
             "repos": [settings.target_repo],
-            "devin_mode": settings.devin_mode,
-            "max_acu_limit": settings.devin_max_acu,
+            "devin_mode": devin_mode or settings.devin_mode,
+            "max_acu_limit": max_acu or settings.devin_max_acu,
         }
         if structured_output_schema:
             body["structured_output_schema"] = structured_output_schema

@@ -18,10 +18,16 @@ from .devin import DevinClient
 from . import github
 from .logging_setup import log
 from .prompts import (
+    AUTOFIX_SCHEMA,
     REMEDIATION_SCHEMA,
+    REVIEW_SCHEMA,
     SCAN_SCHEMA,
+    autofix_title,
+    build_autofix_prompt,
     build_prompt,
+    build_review_prompt,
     build_scan_prompt,
+    review_title,
     scan_title,
     title_for,
 )
@@ -156,6 +162,11 @@ def reconcile_once(store: Store, devin: DevinClient) -> None:
             continue
 
         pr_url, pr_state = DevinClient.extract_pr(session)
+        # The first time we see a PR, record its real GitHub creation time so
+        # time-to-PR isn't inflated by how long the reconciler took to notice it
+        # (e.g. after server/poller downtime). Only one extra call, once per PR.
+        newly_opened = bool(pr_url) and not row.get("pr_opened_at")
+        pr_opened_at = github.get_pr_created_at(pr_url) if newly_opened else None
         store.update_from_session(
             row["issue_number"],
             status=session.get("status", row["status"]),
@@ -163,7 +174,16 @@ def reconcile_once(store: Store, devin: DevinClient) -> None:
             pr_url=pr_url,
             pr_state=pr_state,
             acus=float(session.get("acus_consumed") or 0),
+            pr_opened_at=pr_opened_at,
         )
+
+        # Mirror Cognition's "review on PR open": the moment a remediation opens
+        # a PR, dispatch an INDEPENDENT reviewer session for it. This is the
+        # poll-based fallback for the pull_request webhook (same Settings gate),
+        # so it also works without a public webhook URL.
+        review_trigger = store.get_setting("review_trigger", settings.review_trigger)
+        if newly_opened and settings.review_enabled and review_trigger == "on_pr_open":
+            enqueue_review(store, devin, pr_url=pr_url, issue_number=row["issue_number"])
 
         # Once a PR exists and we haven't yet linked it, comment on the issue.
         if pr_url and not row["commented_back"]:
@@ -178,6 +198,216 @@ def reconcile_once(store: Store, devin: DevinClient) -> None:
                 log(logger, logging.INFO, "reconcile.pr_linked", issue=row["issue_number"], pr=pr_url)
             except httpx.HTTPError as exc:
                 log(logger, logging.WARNING, "reconcile.comment_failed", issue=row["issue_number"], error=str(exc))
+
+
+# --------------------------------------------------------------------- review
+def enqueue_review(
+    store: Store, devin: DevinClient, *, pr_url: str, issue_number: Optional[int],
+    round_no: int = 1,
+) -> Optional[int]:
+    """Dispatch an INDEPENDENT Devin session to review one PR (idempotent per
+    commit SHA). Advisory only — the reviewer never touches the branch; its
+    verdict is consumed as structured data. Returns the review id, or None if
+    already reviewed at this SHA / dispatch is disabled."""
+    if not settings.dispatch_enabled:
+        return None
+    head = github.get_pr_head(pr_url)
+    if not head or not head.get("head_sha"):
+        log(logger, logging.WARNING, "review.no_head_sha", pr=pr_url)
+        return None
+    review_id = store.create_review(
+        repo=settings.target_repo, pr_url=pr_url, pr_number=head["number"],
+        issue_number=issue_number, head_sha=head["head_sha"], round_no=round_no,
+    )
+    if review_id is None:
+        return None  # already reviewed this exact diff
+
+    try:
+        session = devin.create_session(
+            prompt=build_review_prompt(
+                pr_url=pr_url, pr_number=head["number"], issue_number=issue_number
+            ),
+            title=review_title(head["number"]),
+            tags=["pr-review", f"pr-{head['number']}"],
+            structured_output_schema=REVIEW_SCHEMA,
+            devin_mode=settings.review_mode,
+            max_acu=settings.review_max_acu,
+        )
+    except httpx.HTTPError as exc:
+        detail = getattr(getattr(exc, "response", None), "text", str(exc))
+        log(logger, logging.ERROR, "review.dispatch_failed", pr=pr_url, error=detail)
+        return None
+
+    store.mark_review_dispatched(review_id, session["session_id"], session.get("url", ""))
+    log(logger, logging.INFO, "review.dispatched", pr=head["number"], review_id=review_id,
+        session_id=session["session_id"])
+    return review_id
+
+
+def sweep_open_prs_for_review(store: Store, devin: DevinClient) -> int:
+    """Kick an independent review for every open PR the console has tracked that
+    hasn't been reviewed at its current commit. Used to review pre-existing PRs
+    (the on-open trigger only catches new ones). Returns count dispatched."""
+    dispatched = 0
+    for r in store.with_prs():
+        if (r.get("pr_state") or "").lower() == "merged":
+            continue
+        if enqueue_review(store, devin, pr_url=r["pr_url"], issue_number=r["issue_number"]):
+            dispatched += 1
+    return dispatched
+
+
+def _review_comment_body(verdict: str, summary: str, security: str,
+                         findings: list[dict[str, Any]]) -> str:
+    icon = {"approve": "✅ Approve", "request_changes": "🛑 Request changes",
+            "comment": "💬 Comment"}.get(verdict, verdict)
+    sev = {"red": "🔴", "yellow": "🟡", "gray": "⚪"}
+    lines = [f"## 🤖 Devin independent review — {icon}", "", summary]
+    if security:
+        lines += ["", f"**Security review:** {security}"]
+    reds = [f for f in findings if f.get("severity") == "red"]
+    others = [f for f in findings if f.get("severity") != "red"]
+    if findings:
+        lines += ["", "### Findings"]
+        for f in reds + others:
+            loc = f" (`{f['file']}`{':' + str(f['line']) if f.get('line') else ''})" if f.get("file") else ""
+            lines.append(f"- {sev.get(f.get('severity'), '')} **{f.get('title','')}**{loc} — {f.get('detail','')}")
+    lines += ["", "_Independent review by a separate Devin session. Advisory only — "
+              "this reviewer does not modify the branch._"]
+    return "\n".join(lines)
+
+
+def reconcile_reviews(store: Store, devin: DevinClient) -> None:
+    """Poll dispatched review sessions; once a verdict lands, persist it and post
+    a single consolidated advisory comment on the PR (idempotent per SHA)."""
+    for rev in store.reviews_to_poll():
+        session_id = rev["devin_session_id"]
+        try:
+            session = devin.get_session(session_id)
+        except httpx.HTTPError as exc:
+            log(logger, logging.WARNING, "review.poll_failed", review_id=rev["id"], error=str(exc))
+            continue
+
+        so = session.get("structured_output")
+        so = so if isinstance(so, dict) else {}
+        verdict = so.get("verdict")
+        findings = so.get("findings") if isinstance(so.get("findings"), list) else []
+        counts = {"red": 0, "yellow": 0, "gray": 0}
+        for f in findings:
+            if f.get("severity") in counts:
+                counts[f["severity"]] += 1
+
+        store.update_review_from_session(
+            rev["id"],
+            status=session.get("status", rev["status"]),
+            status_detail=session.get("status_detail"),
+            acus=float(session.get("acus_consumed") or 0),
+            verdict=verdict, summary=so.get("summary"),
+            n_red=counts["red"], n_yellow=counts["yellow"], n_gray=counts["gray"],
+        )
+
+        # One consolidated advisory comment, only once we have a verdict.
+        if verdict and not rev["comment_posted"]:
+            posted = github.post_review_comment(
+                rev["pr_url"], rev["head_sha"],
+                _review_comment_body(verdict, so.get("summary", ""),
+                                     so.get("security_review", ""), findings),
+            )
+            if posted:
+                store.mark_review_commented(rev["id"])
+                log(logger, logging.INFO, "review.commented", pr=rev["pr_number"], verdict=verdict)
+
+
+def reconcile_autofix(store: Store, devin: DevinClient) -> None:
+    """Close the loop: for a blocking review, dispatch a bounded fix session, then
+    re-review the new commit — capped at `autofix_max_rounds`, then escalate to a
+    human. The loop converges because each fix is scoped to just the red findings
+    and the round cap is enforced here, not by the sessions negotiating."""
+    autofix_on = store.get_setting("autofix", "on" if settings.autofix_enabled else "off") == "on"
+    if not (settings.dispatch_enabled and autofix_on):
+        return
+
+    # (1) A review says request_changes and nothing has handled it yet.
+    for rev in store.reviews_needing_autofix():
+        attempts = store.autofix_attempts(rev["pr_url"])
+        if attempts >= settings.autofix_max_rounds:
+            # Rounds exhausted — hand off to a human rather than loop forever.
+            github.post_review_comment(
+                rev["pr_url"], f"{rev['head_sha']}-escalate",
+                f"## 🤖 Devin autofix — ⚠️ escalating to a human\n\n"
+                f"After {attempts} autofix round(s), blocking findings remain on this PR. "
+                f"Stopping the automated loop and leaving this for a human reviewer — "
+                f"the remaining issue likely needs a product or architecture decision.",
+            )
+            store.mark_review_escalated(rev["id"])
+            log(logger, logging.INFO, "autofix.escalated", pr=rev["pr_number"], attempts=attempts)
+            continue
+
+        head = github.get_pr_head(rev["pr_url"])
+        branch = (head or {}).get("head_ref") or ""
+        try:
+            reds = _red_findings_for(devin, rev)
+            session = devin.create_session(
+                prompt=build_autofix_prompt(
+                    pr_url=rev["pr_url"], pr_number=rev["pr_number"], branch=branch,
+                    round_no=attempts + 1, max_rounds=settings.autofix_max_rounds, findings=reds,
+                ),
+                title=autofix_title(rev["pr_number"], attempts + 1),
+                tags=["autofix", f"pr-{rev['pr_number']}"],
+                structured_output_schema=AUTOFIX_SCHEMA,
+                devin_mode=settings.autofix_mode,
+                max_acu=settings.autofix_max_acu,
+            )
+        except httpx.HTTPError as exc:
+            detail = getattr(getattr(exc, "response", None), "text", str(exc))
+            log(logger, logging.ERROR, "autofix.dispatch_failed", pr=rev["pr_number"], error=detail)
+            continue
+        store.set_review_autofix(rev["id"], session["session_id"], session.get("url", ""))
+        log(logger, logging.INFO, "autofix.dispatched", pr=rev["pr_number"],
+            round=attempts + 1, session_id=session["session_id"])
+
+    # (2) An autofix is running — when it pushes a new commit, re-review that SHA.
+    for rev in store.reviews_with_active_autofix():
+        try:
+            session = devin.get_session(rev["autofix_session_id"])
+        except httpx.HTTPError as exc:
+            log(logger, logging.WARNING, "autofix.poll_failed", review_id=rev["id"], error=str(exc))
+            continue
+        so = session.get("structured_output")
+        so = so if isinstance(so, dict) else {}
+        if so.get("status"):
+            store.update_autofix_status(rev["id"], so["status"])
+
+        head = github.get_pr_head(rev["pr_url"])
+        new_sha = (head or {}).get("head_sha")
+        if new_sha and new_sha != rev["head_sha"] and not store.get_review(rev["pr_url"], new_sha):
+            # New commit on the branch -> re-review it (round + 1).
+            enqueue_review(store, devin, pr_url=rev["pr_url"],
+                           issue_number=rev["issue_number"], round_no=(rev["round"] or 1) + 1)
+            store.mark_review_reviewed_next(rev["id"])
+            log(logger, logging.INFO, "autofix.re_review", pr=rev["pr_number"], new_sha=new_sha[:10])
+        elif so.get("status") == "cannot_fix":
+            # Author couldn't resolve it and pushed nothing -> escalate.
+            github.post_review_comment(
+                rev["pr_url"], f"{rev['head_sha']}-cannotfix",
+                "## 🤖 Devin autofix — ⚠️ could not resolve\n\n"
+                f"{so.get('summary', 'The autofix session could not resolve the blocking findings.')}\n\n"
+                "Escalating to a human reviewer.",
+            )
+            store.mark_review_escalated(rev["id"])
+            log(logger, logging.INFO, "autofix.cannot_fix", pr=rev["pr_number"])
+
+
+def _red_findings_for(devin: DevinClient, rev: dict[str, Any]) -> list[dict[str, Any]]:
+    """Re-read the review session's structured output to recover its red findings
+    (we persist only counts, so fetch the detail to scope the fix precisely)."""
+    try:
+        session = devin.get_session(rev["devin_session_id"])
+    except httpx.HTTPError:
+        return []
+    so = session.get("structured_output")
+    findings = so.get("findings") if isinstance(so, dict) else None
+    return [f for f in (findings or []) if f.get("severity") == "red"]
 
 
 def start_scan(store: Store, devin: DevinClient) -> dict[str, Any]:
